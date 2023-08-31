@@ -1,0 +1,276 @@
+---
+title: "Autobinning Analysis for Freyja Data"
+output: html_document
+date: "2023-08-21"
+author: "Michael Parcey, PHAC"
+---
+
+Samples were screened to only include samples with coverage >=70%  
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(tidyverse)
+library(lubridate)
+library(rjson)
+```
+
+```{r, echo=FALSE, include=FALSE}
+## Function to convert aggregate table into long format
+convert.to.long <- function(df.in){
+  for (i in 1:nrow(df.in)) {
+    lineages <- strsplit(df.in[i,]$lineages, " ")[[1]]
+    abundances <- strsplit(df.in[i,]$abundances, " ")[[1]]
+    samples <- rep(df.in[i,]$X, length(lineages))
+    coverage <- rep(df.in[i,]$coverage, length(lineages))
+    if (i == 1){
+      df.all <- data.frame(samples = samples, lineages = lineages, abundances = abundances, coverage = coverage)
+    } else {
+      df.all <- rbind(df.all, data.frame(samples = samples, lineages = lineages, abundances = abundances, coverage = coverage))
+    }
+  }
+  return(df.all)
+}
+
+## Function to pull the date from sample name. This would have to be modified to account for how the date is stored
+GetDate <- function(ent_id){
+  parts <- str_split(ent_id, "-")[[1]]
+  sample.date <- ymd(as.Date(paste(substr(parts[2],start=1,stop=4),"-",substr(parts[2],start=5,stop=6),"-",substr(parts[2],start=7,stop=8), sep="")))
+  return(format(as.Date(sample.date,origin="1970-01-01")))
+}
+
+
+## Function to dealias the pango lineages
+dealias <- function(lin){
+  alias.name <- paste("alias_key_",Sys.Date(),".json",sep="")
+  if(!(file.exists(alias.name))){
+    download.file("https://raw.github.com/cov-lineages/pango-designation/master/pango_designation/alias_key.json", alias.name)
+  }
+  aliases <- fromJSON(file=alias.name)
+  # print(lin)
+  if (substr(lin, start = 1, stop = 1) != "X"){
+    dealiased <- aliases[[substr(lin, start = 1, stop = 2)]]
+    return(paste(dealiased,substr(lin, start = 3, stop = nchar(lin)), sep=""))
+  } else {
+    return(lin)
+  }
+}
+
+```
+
+```{r, echo=FALSE, include=FALSE}
+## Creates the bins the data will be processed in
+createBins <- function(df.in, nweeks){
+  df.in$abundances <- as.numeric(df.in$abundances)
+
+  ## Subset for number of week
+  df.in <- subset(df.in, df.in$week >= max(df.in$week) - ((nweeks-1)*7))
+  
+  ## Get relative abundance of lineages over the analysis period
+  totalsamples <- length(unique(df.in$sample))
+    major <- df.in %>%
+    group_by(dealias) %>%
+    summarize(avgAbun = sum(abundances)/totalsamples)
+  
+  ## Get number of branchs in the lineage and reorganize data
+  major$len <- sapply(major$dealias, function(ent_id){length(str_split(ent_id, "[.]")[[1]])})
+  major <- major[, c(1, 3, 2)]
+  
+  ## Aggregates the lineages from longest to shortest to reach threshold
+  for (i in max(major$len):min(major$len)){
+    if (i==max(major$len)){
+      major.temp <- subset(major, major$len==i)
+    } else {
+      major.temp <- rbind(major.temp, subset(major, major$len==i))
+    }
+    major.temp <- major.temp %>%
+      group_by(dealias, len) %>%
+      summarize(avgAbun = sum(avgAbun), .groups = 'keep')
+    major.temp$dealias <- CompoundLineages(major.temp)
+    major.temp$len <- sapply(major.temp$dealias, function(ent_id){length(str_split(ent_id, "[.]")[[1]])})
+    if (i == min(major$len)){
+      major.temp <- major.temp %>%
+        group_by(dealias, len) %>%
+        summarize(avgAbun = sum(avgAbun), .groups = 'keep')
+    }
+  }
+  
+  ## Can be added to output the major lineages
+  # cDate <- Sys.Date()
+  # write.csv(major.temp, paste("Lineage_Summary.csv", sep=""))
+  
+  return(major.temp)
+}
+
+## Function for aggregating lineages
+## If the lineage can be aggregate, remove the most distant designation (eg BA.1.2 to BA.1)
+CompoundLineages <- function(df.in){
+  for (row in 1:nrow(df.in)){
+    if (grepl(".", df.in[row, "dealias"], fixed = TRUE)){
+      lin.split <- str_split(df.in[row, "dealias"], "[.]")[[1]]
+      
+      ## This line is here to stop B lineages at omicron/delta
+      if (!(lin.split[1]=="B" && length(lin.split) <= 4)){
+        if (df.in[row, "avgAbun"] < abundance.cutoff){
+          df.in[row, "dealias"] <- paste(lin.split[1:(length(lin.split)-1)], collapse = ".")
+          }
+      }
+    }
+  }
+   return(df.in$dealias)
+}
+
+## Function that finds closest parent in the majore lineages
+binLin <- function(lin, maj.lin){
+  while(TRUE){
+    if(lin %in% maj.lin){
+      return(lin)
+      break
+    } else {
+      lin.temp <- str_split(lin, "[.]")[[1]]
+      lin <- paste(lin.temp[1:(length(lin.temp)-1)], collapse = ".")
+    }
+  }
+}
+
+realias <- function(lin){
+  # lin <- "XBB.1.5.15.1.1"
+  sublin <- str_split(lin, "[.]")[[1]]
+  alias.name <- paste("alias_key_",Sys.Date(),".json",sep="")
+  if(!(file.exists(alias.name))){
+    download.file("https://raw.github.com/cov-lineages/pango-designation/master/pango_designation/alias_key.json", alias.name)
+  }
+  aliases <- fromJSON(file=alias.name)
+  lin.name <- lin
+  for(i in length(sublin):1){
+    match = FALSE
+    comlin <- ""
+    for (j in 1:i){
+      comlin <- paste(comlin,sublin[j],sep="")
+      if (j != i){
+        comlin <- paste(comlin,".",sep="")
+      }
+    }
+    for (n in names(aliases)){
+      if(substr(n, start = 1, stop = 1) != "X" && comlin == aliases[[n]]){
+        lin.name <- n
+        if(length(sublin) > i){
+          for(k in 1:(length(sublin)-i)){
+            lin.name <- paste(lin.name, ".", sublin[k+i], sep = "")
+          }
+        }
+        match = TRUE
+        break
+      }
+    }
+    if (match){
+            break
+    }  
+  }
+  return(lin.name)
+}
+
+## Combines aliased and dealiased id for graphing
+CheckLinName <- function(df.in){
+  for (row in 1:nrow(df.in)){
+    if (df.in[row, "binned"] != df.in[row, "realias"] && df.in[row, "binned"] != "Minor"){
+      df.in[row, "binned"] <- paste(df.in[row, "binned"]," (",df.in[row, "realias"],")", sep="")
+    }
+  }
+  return(df.in$binned)
+}
+```
+
+```{r, echo=FALSE, include=FALSE}
+## Load in the datasheet of interest
+FreyjaFile <- read.table("freyja-out-aggregate.tsv", sep="\t", header = TRUE)
+
+## Set coverage cutoff. Will skip if set to 0
+coverage.cutoff=70
+if (coverage.cutoff > 0){
+  FreyjaFile <- subset(FreyjaFile, FreyjaFile$coverage >= coverage.cutoff)
+}
+
+## Coverage Data into long format
+FreyjaIn <- convert.to.long(FreyjaFile)
+
+
+FreyjaIn$abundances <- as.numeric(FreyjaIn$abundances)
+
+## Set minimum abundance required for analysis cutoff. Will skip if set to 0
+min.abundance=0.01
+if (min.abundance > 0){
+  FreyjaIn <- subset(FreyjaIn, FreyjaIn$abundances >= min.abundance)
+}
+
+## Set desired cumulative abundance cutoff
+abundance.cutoff=0.05
+
+## Set the desire analysis period. You may want to do multiple periods (e.g.) 6 weeks, 16 weeks, ect. and loop the code.
+analysis.period=6
+
+## Adds date collected column. creates a week column for binning. Currently based on sample name.
+FreyjaIn$collected <- sapply(FreyjaIn$sample, GetDate)
+FreyjaIn$week <- floor_date(ymd(FreyjaIn$collected), "week")
+
+## Adds Site information into a column. Currently based on sample name.
+FreyjaIn$site <- sapply(FreyjaIn$sample, function(ent_id){str_split(ent_id, "-")[[1]][1]})
+                        
+## Looks up the current pangolin aliases json file and deliases the lineages
+FreyjaIn$dealias <- sapply(FreyjaIn$lineage, dealias)
+```
+
+
+## Relative Abundance of lineages of analysis period
+```{r, echo=FALSE}
+## Autobins the data based on the analysis period
+Major.Lineages <- createBins(FreyjaIn, analysis.period)
+Major.Lineages
+```
+  
+  
+```{r, echo=FALSE, include=FALSE}
+
+## Used to create a subset of lineages that are less that the abundance cutoff that couldn't be further aggregated (eg unusual recombinants)
+Other.Lineages <- subset(Major.Lineages, Major.Lineages$avgAbun < abundance.cutoff)
+
+## Bin based on the major lineages and realias
+FreyjaIn$binned <- sapply(FreyjaIn$dealias, maj.lin = Major.Lineages$dealias, binLin)
+FreyjaIn$realias <- sapply(FreyjaIn$binned, realias)
+
+FreyjaIn$binned <- sapply(FreyjaIn$binned, othr.lin = Other.Lineages$dealias, 
+                          function(lineage, othr.lin){
+                            if (lineage %in% othr.lin){
+                              return("Minor")
+                              } else {
+                                return(lineage)
+                                }
+                            })
+
+FreyjaIn$long <- CheckLinName( FreyjaIn)
+
+```
+
+```{r, echo=FALSE}
+for(site in unique(FreyjaIn$site)){
+  
+  ## Outside of ggplot to ensure correct subsetting 
+  site.temp <- FreyjaIn$site == site
+  FreyjaIn.temp <- subset(FreyjaIn, site.temp)
+  
+  print(
+    ggplot(FreyjaIn.temp) +
+      geom_col(aes(x=week, y=abundances, fill=long)) +
+      labs(title=paste(site, "Plot"), x ="Week", y = "Relative \nLineage Abundance") +
+      theme(axis.text.x = element_text(angle = 25, vjust = 1, hjust = 1.1))
+  )
+}
+```
+
+
